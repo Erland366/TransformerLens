@@ -868,6 +868,7 @@ def get_pretrained_state_dict(
     official_model_name: str,
     cfg: HookedTransformerConfig,
     hf_model=None,
+    quantized=False,
     **kwargs,
 ) -> Dict[str, torch.Tensor]:
     """
@@ -955,7 +956,10 @@ def get_pretrained_state_dict(
         elif cfg.original_architecture == "GPTNeoXForCausalLM":
             state_dict = convert_neox_weights(hf_model, cfg)
         elif cfg.original_architecture == "LLaMAForCausalLM":
-            state_dict = convert_llama_weights(hf_model, cfg)
+            if quantized:
+                state_dict = convert_llama_quantized_weights(hf_model, cfg)
+            else:
+                state_dict = convert_llama_weights(hf_model, cfg)
         elif cfg.original_architecture == "BertForMaskedLM":
             state_dict = convert_bert_weights(hf_model, cfg)
         else:
@@ -1242,6 +1246,80 @@ def convert_llama_weights(llama, cfg: HookedTransformerConfig):
 
         W_O = llama.model.layers[l].self_attn.o_proj.weight
         W_O = einops.rearrange(W_O, "m (n h)->n h m", n=cfg.n_heads)
+        state_dict[f"blocks.{l}.attn.W_O"] = W_O
+
+        state_dict[f"blocks.{l}.attn.b_O"] = torch.zeros(cfg.d_model)
+
+        state_dict[f"blocks.{l}.ln2.w"] = llama.model.layers[
+            l
+        ].post_attention_layernorm.weight
+
+        state_dict[f"blocks.{l}.mlp.W_in"] = llama.model.layers[l].mlp.up_proj.weight.T
+        state_dict[f"blocks.{l}.mlp.W_gate"] = llama.model.layers[
+            l
+        ].mlp.gate_proj.weight.T
+        state_dict[f"blocks.{l}.mlp.b_in"] = torch.zeros(cfg.d_mlp)
+
+        state_dict[f"blocks.{l}.mlp.W_out"] = llama.model.layers[
+            l
+        ].mlp.down_proj.weight.T
+        state_dict[f"blocks.{l}.mlp.b_out"] = torch.zeros(cfg.d_model)
+
+    state_dict["ln_final.w"] = llama.model.norm.weight
+
+    state_dict["unembed.W_U"] = llama.lm_head.weight.T
+    state_dict["unembed.b_U"] = torch.zeros(cfg.d_vocab)
+
+    return state_dict
+
+def convert_llama_quantized_weights(llama, cfg: HookedTransformerConfig):
+    """
+    For now we just focused to quantize llama model to 4-bit with this configuration
+    Of course it's going to use BitsAndBytes
+    BitsAndBytesConfig(
+        load_in_4bit=True,
+        load_in_8bit=False,
+        llm_int8_threshold=6.0,
+        llm_int8_has_fp16_weight=False,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type='nf4'
+    ),
+
+    """
+    state_dict = {}
+
+    state_dict["embed.W_E"] = llama.model.embed_tokens.weight
+
+    # llama has no biases anywhere and deals with everything else roughly like
+    # GPTNeoX with different names
+
+    for l in range(cfg.n_layers):
+        state_dict[f"blocks.{l}.ln1.w"] = llama.model.layers[l].input_layernorm.weight
+
+        W_Q = llama.model.layers[l].self_attn.q_proj.weight
+        W_K = llama.model.layers[l].self_attn.k_proj.weight
+        W_V = llama.model.layers[l].self_attn.v_proj.weight
+        W_Q = einops.rearrange(W_Q, "(n h) m->n m h", n=cfg.n_heads)
+        W_K = einops.rearrange(W_K, "(n h) m->n m h", n=cfg.n_heads)
+        W_V = einops.rearrange(W_V, "(n h) m->n m h", n=cfg.n_heads)
+        state_dict[f"blocks.{l}.attn.W_Q"] = W_Q
+        state_dict[f"blocks.{l}.attn.W_K"] = W_K
+        state_dict[f"blocks.{l}.attn.W_V"] = W_V
+
+        state_dict[f"blocks.{l}.attn.b_Q"] = torch.zeros(cfg.n_heads, cfg.d_head)
+        state_dict[f"blocks.{l}.attn.b_K"] = torch.zeros(cfg.n_heads, cfg.d_head)
+        state_dict[f"blocks.{l}.attn.b_V"] = torch.zeros(cfg.n_heads, cfg.d_head)
+
+        W_O = llama.model.layers[l].self_attn.o_proj.weight
+        # the problem is here where we tried to change the shape from 
+        # 8388608, 1 to n, h, m where n = 32
+        # But in original llama, it's 4096, 4096
+        # But in the quantized one, seems like it's 4096, 2048
+        # So below result will be 32, 128, 4096
+        # Let's try to change it to 32, 64, 4096
+        # Maybe change it to (m, h, n), x -> n h m, n=cfg.n_heads, m=cfg.d_model
+        W_O = einops.rearrange(W_O, "m (n h)->n h m", n=cfg.n_heads, m=cfg.d_model)
         state_dict[f"blocks.{l}.attn.W_O"] = W_O
 
         state_dict[f"blocks.{l}.attn.b_O"] = torch.zeros(cfg.d_model)

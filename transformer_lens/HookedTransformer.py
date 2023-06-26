@@ -781,6 +781,7 @@ class HookedTransformer(HookedRootModule):
         move_state_dict_to_device=True,
         tokenizer=None,
         move_to_device=True,
+        quantized=False,
         **from_pretrained_kwargs,
     ) -> "HookedTransformer":
         """Class method to load in a pretrained model weights to the HookedTransformer format and optionally to do some
@@ -878,7 +879,7 @@ class HookedTransformer(HookedRootModule):
         # Get the state dict of the model (ie a mapping of parameter names to tensors), processed to match the
         # HookedTransformer parameter names.
         state_dict = loading.get_pretrained_state_dict(
-            official_model_name, cfg, hf_model, **from_pretrained_kwargs
+            official_model_name, cfg, hf_model, quantized=quantized, **from_pretrained_kwargs
         )
 
         # Create the HookedTransformer object
